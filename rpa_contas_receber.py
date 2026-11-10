@@ -8,6 +8,7 @@ Uso (no terminal, dentro desta pasta):
     python rpa_contas_receber.py teste 144       -> idem, para a linha 144 (ou um nº de pedido)
     python rpa_contas_receber.py gravar 144      -> aperta Ok (F9) no documento preenchido e apaga J da linha 144
     python rpa_contas_receber.py rodar           -> lanca todos os pedidos que ainda tem a coluna J preenchida
+    python rpa_contas_receber.py retomar 8 1     -> termina o documento ja aberto da linha 8 (1 item ja lancado) e segue com os demais
 
 Seguranca:
   - Leve o mouse para o CANTO SUPERIOR ESQUERDO da tela para abortar na hora.
@@ -69,6 +70,8 @@ PAINEL_BASE = {
     "ok_baixo": (1767, 531),
     # Formulario do item
     "item_codigo": (55, 553),
+    "item_sta": (32, 705),
+    "item_stb": (244, 705),
     "item_unidade": (38, 793),
     "item_qtd": (302, 793),
     "item_valor": (393, 793),
@@ -84,6 +87,9 @@ PASTA = os.path.dirname(os.path.abspath(__file__))
 PASTA_PRINTS = os.path.join(PASTA, "prints_rpa")
 REF_ABAS = os.path.join(PASTA, "ref_abas.png")
 REF_ABAS_TOPO = 493
+REF_MSG_STA = os.path.join(PASTA, "ref_msg_sta.png")      # texto: Campo "STA" em branco.
+REF_MSG_CAMPO_ST = os.path.join(PASTA, "ref_msg_campo_st.png")  # texto: Campo "ST
+VALORES_ST = {"item_sta": "0", "item_stb": "40"}  # o que digitar quando o Fortes reclama do campo em branco
 
 
 def ajustar_painel():
@@ -126,6 +132,12 @@ def normaliza(nome):
 RE_TITULO = re.compile(r"^SAIDA DE (.+?)\s*\(", re.I)
 RE_CABEC = re.compile(r"^(.*?) - (\d+) - (\d{2}/\d{2}/\d{2,4}) - (.*)$")
 RE_ITEM = re.compile(r"^([\d.,]+) (SACOS?|KG) DE (.+?) A R\$ ([\d.,]+)$", re.I)
+# Produtos vendidos por KG: forca a unidade KG mesmo se a descricao disser SACOS.
+PALAVRAS_KG = {"CAROCO", "OLEO", "KG"}
+
+
+def eh_boleto(texto):
+    return "BOLET" in normaliza(texto)
 
 
 def abrir_planilha():
@@ -172,6 +184,9 @@ def ler_pedidos():
             continue  # cancelado: ignora
         partes = [p.strip() for p in resto.split(" - ")]
         forma = partes[-1] if partes and not RE_ITEM.match(partes[-1]) else ""
+        if eh_boleto(forma) or eh_boleto(txt(linha[7])):
+            problemas.append((i, pedido, f"{nome.strip()}: pago com BOLETO - nao lancar"))
+            continue
         itens, erro = [], None
         for p in partes:
             mi = RE_ITEM.match(p)
@@ -184,7 +199,7 @@ def ler_pedidos():
             itens.append({
                 "codigo": cod_item,
                 "produto": prod,
-                "unidade": "KG" if un.upper() == "KG" else "SC",
+                "unidade": "KG" if un.upper() == "KG" or PALAVRAS_KG & set(normaliza(prod).split()) else "SC",
                 "qtd": num(qtd),
                 "preco": num(preco),
             })
@@ -496,9 +511,10 @@ def achar_janela(trecho_titulo):
     return achadas[0] if achadas else None
 
 
-def responder_nao(motivo, espera_max=4.0):
+def responder_nao(motivo, espera_max=4.0, desistir=None):
     """Confirmacao do Fortes (recalcular tributos retidos? / gerar nota fiscal?) -> clica em Nao.
-    O botao Nao fica a (+230, +92) do canto da janela 'Confirmação' (383 x 125)."""
+    O botao Nao fica a (+230, +92) do canto da janela 'Confirmação' (383 x 125).
+    desistir: funcao opcional; se devolver True, para de esperar pela pergunta."""
     fim = time.time() + espera_max
     while time.time() < fim:
         h = achar_janela("Confirmação")
@@ -507,9 +523,15 @@ def responder_nao(motivo, espera_max=4.0):
             acao(f"confirmacao '{motivo}' -> clique em Nao ({l + 230}, {t + 92})")
             pyautogui.click(l + 230, t + 92)
             esperar(PAUSA)
+            for _ in range(50):  # o acesso remoto as vezes demora: espera ate +10 s a janela fechar
+                if not achar_janela("Confirmação"):
+                    break
+                esperar(0.2)
             if achar_janela("Confirmação"):
                 raise TelaErrada("Cliquei em Nao mas a Confirmacao continuou aberta.")
             return True
+        if desistir is not None and desistir():
+            return False
         esperar(0.2)
     return False
 
@@ -519,7 +541,9 @@ def fechar_subform(recalcular=False):
     checar_parada()
     pyautogui.click(*P["ok_baixo"])
     if recalcular:
-        responder_nao('recalcular tributos retidos?')
+        # o Fortes as vezes demora varios segundos para perguntar; se o formulario ja fechou, nao vem pergunta
+        responder_nao('recalcular tributos retidos?', espera_max=15.0,
+                      desistir=lambda: not subform_aberto())
     esperar(PAUSA_TELA)
     confirmar_mensagem(tentativas=2)
     for _ in range(40):  # Fortes as vezes demora: espera ate +8 s o formulario fechar
@@ -545,7 +569,65 @@ class TelaErrada(Exception):
     pass
 
 
-def lancar(ped, salvar=True):
+def texto_na_mensagem(ref, regiao):
+    import pyscreeze
+    try:
+        return pyscreeze.locateOnScreen(ref, region=regiao) is not None
+    except pyscreeze.ImageNotFoundException:
+        return False
+
+
+def campo_st_da_mensagem():
+    """Olha o texto da mensagem 'Atencao!' na frente: devolve item_sta / item_stb, ou None
+    se for qualquer outra mensagem. O texto do STB nunca foi visto: vale o inicio 'Campo "ST'."""
+    h = win32gui.GetForegroundWindow()
+    l, t, r, b = win32gui.GetWindowRect(h)
+    regiao = (l, t, r - l, b - t)
+    if texto_na_mensagem(REF_MSG_STA, regiao):
+        return "item_sta"
+    if texto_na_mensagem(REF_MSG_CAMPO_ST, regiao):
+        return "item_stb"
+    return None
+
+
+def aguardar_mensagem(segundos):
+    fim = time.time() + segundos
+    while time.time() < fim:
+        tit = mensagem_do_fortes()
+        if tit is not None:
+            return tit
+        esperar(0.1)
+    return mensagem_do_fortes()
+
+
+def tratar_st_em_branco():
+    """Sai do bloco de situacao tributaria clicando em Unidade. Se o Fortes avisar
+    'Campo "STA" em branco' -> Ok e digita 0; se avisar do campo seguinte -> Ok e digita 40."""
+    feitos = set()
+    for _ in range(len(VALORES_ST) + 1):
+        if mensagem_do_fortes() is None:
+            conferir_janela("(antes de sair do bloco de situacao tributaria)")
+            checar_parada()
+            acao("clique em item_unidade (confere STA/STB)")
+            pyautogui.click(*P["item_unidade"])
+        tit = aguardar_mensagem(2.0)
+        if tit is None:
+            return
+        campo = campo_st_da_mensagem() if "Atenção" in tit else None
+        if campo is None or campo in feitos:
+            raise TelaErrada(f"Apareceu a janela '{tit}' e nao sei o que responder - parei.")
+        feitos.add(campo)
+        valor = VALORES_ST[campo]
+        print(f"[{campo[5:].upper()} em branco -> {valor}] ", end="", flush=True)
+        pyautogui.press("enter")
+        esperar(PAUSA)
+        if mensagem_do_fortes() is not None:
+            raise TelaErrada("Apertei Ok mas a mensagem do campo em branco continuou aberta.")
+        preencher(campo, valor, espera=PAUSA_LOOKUP, mensagem=True, verificar=False)
+    raise TelaErrada("O Fortes continuou reclamando de STA/STB depois de preencher.")
+
+
+def abrir_e_preencher_cabecalho(ped):
     # Novo documento: precisa estar na LISTA de Contas a Receber - Documentos
     if em_inclusao():
         raise TelaErrada("Ja existe um documento aberto no Fortes. Grave ou cancele e rode de novo.")
@@ -567,13 +649,24 @@ def lancar(ped, salvar=True):
     preencher("emissao", data_digitos(ped["emissao"]))
     colar("obs", ped["obs"])
     esperar(0.5)
+
+
+def lancar(ped, salvar=True, itens_feitos=0):
+    """itens_feitos > 0: retoma um documento que ja esta aberto, pulando o cabecalho e esses itens."""
+    if itens_feitos:
+        if not em_inclusao():
+            raise TelaErrada("Mandei retomar, mas nao ha documento aberto no Fortes.")
+        acao(f"retomando documento aberto, pulando {itens_feitos} item(ns)")
+    else:
+        abrir_e_preencher_cabecalho(ped)
     ajustar_painel()
 
     # Itens
     clicar("aba_itens", PAUSA_TELA / 2)
-    for it in ped["itens"]:
+    for it in ped["itens"][itens_feitos:]:
         abrir_subform()
         preencher("item_codigo", it["codigo"], espera=PAUSA_LOOKUP)
+        tratar_st_em_branco()
         preencher("item_unidade", it["unidade"])
         preencher("item_qtd", br(it["qtd"], 0) if it["qtd"].is_integer() else br(it["qtd"]))
         preencher("item_valor", br(it["preco"]))
@@ -600,13 +693,16 @@ def gravar_documento():
     """Ok (F9) do documento -> 'Deseja gerar nota fiscal?' -> Nao -> confere que fechou."""
     if not em_inclusao():
         raise TelaErrada("Nao ha documento aberto no Fortes para gravar.")
-    conferir_janela("(antes do Ok final)")
-    acao("clique em Ok (F9) do documento")
-    checar_parada()
-    pyautogui.click(*P["ok_documento"])
-    if not responder_nao("gerar nota fiscal?", espera_max=6.0):
+    if achar_janela("Confirmação"):
+        acao("pergunta 'gerar nota fiscal?' ja estava aberta: nao clico em Ok de novo")
+    else:
+        conferir_janela("(antes do Ok final)")
+        acao("clique em Ok (F9) do documento")
+        checar_parada()
+        pyautogui.click(*P["ok_documento"])
+    if not responder_nao("gerar nota fiscal?", espera_max=30.0):
         raise TelaErrada("Depois do Ok nao apareceu a pergunta 'gerar nota fiscal?' - confira o Fortes.")
-    for _ in range(30):  # espera o documento fechar e voltar para a lista
+    for _ in range(150):  # espera ate 30 s o documento fechar e voltar para a lista
         esperar(0.2)
         if not em_inclusao() and fortes_na_frente():
             acao("documento gravado (voltou para a lista)")
@@ -643,7 +739,14 @@ def main():
         return
 
     pendentes = pedidos
-    alvos = sys.argv[2:]  # uma ou mais linhas (ou nº de pedido), na ordem dada
+    linha_retomar, itens_feitos = None, 0
+    if modo == "retomar":  # retomar <linha> <itens ja lancados>: termina o documento aberto e segue com os demais
+        linha_retomar, itens_feitos = int(sys.argv[2]), int(sys.argv[3])
+        if not any(p["linha"] == linha_retomar for p in pedidos):
+            raise SystemExit(f"Nao achei pedido valido na linha {linha_retomar}.")
+        pendentes = sorted(pedidos, key=lambda p: p["linha"] != linha_retomar)
+
+    alvos = [] if modo == "retomar" else sys.argv[2:]  # uma ou mais linhas (ou nº de pedido), na ordem dada
     if alvos:
         pendentes = []
         for a in alvos:
@@ -689,7 +792,8 @@ def main():
         print(f"[{n}/{len(pendentes)}] Linha {ped['linha']} pedido {ped['pedido']} - {ped['nome']} - "
               f"R$ {br(ped['total'])} ... ", end="", flush=True)
         try:
-            arq = lancar(ped, salvar=(modo != "teste"))
+            arq = lancar(ped, salvar=(modo != "teste"),
+                         itens_feitos=itens_feitos if ped["linha"] == linha_retomar else 0)
         except (pyautogui.FailSafeException, Parada):
             print("\nPARADO pelo usuario (ESC / mouse no canto). Confira o Fortes: o documento "
                   "ficou aberto sem gravar - cancele ou termine a mao.")

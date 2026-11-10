@@ -19,6 +19,9 @@ Option Explicit
 '   ficam com a coluna I em branco e um alerta na coluna K. Ajustes manuais/excecoes ficam
 '   na funcao CriarMapaMercadorias().
 ' - Gera o resumo do pedido na coluna J (primeira ocorrencia).
+'   Pedidos pagos com BOLETO NAO recebem resumo (so um alerta na coluna K), para nao
+'   serem lancados no Contas a Receber.
+'   Unidade: KG para CAROCO e OLEO (ou titulo com a palavra "KG"); SACOS para o resto.
 ' - Deixa a coluna I em branco quando nao encontra correspondencia com confianca suficiente.
 ' - Grava alertas na coluna K para pedidos com clientes diferentes ou preco atipico.
 ' - Diferencas de ate R$ 5,00 no preco unitario nao geram alerta.
@@ -64,6 +67,8 @@ Public Sub GerarResumoPedidos_ComCodigoCliente()
     Dim itensCarregados As Boolean
     Dim cacheItens As Object
     Dim totalMercadoriasSemCodigo As Long
+    Dim pedidosBoleto As Object
+    Dim totalBoleto As Long
 
     On Error Resume Next
     Set ws = ThisWorkbook.Sheets("Planilha1")
@@ -78,6 +83,7 @@ Public Sub GerarResumoPedidos_ComCodigoCliente()
     Set precoPorMercadoria = CreateObject("Scripting.Dictionary")
     Set precoPadraoPorMercadoria = CreateObject("Scripting.Dictionary")
     Set cacheCodigos = CreateObject("Scripting.Dictionary")
+    Set pedidosBoleto = CreateObject("Scripting.Dictionary")
     Set regex = CreateObject("VBScript.RegExp")
 
     If Not CarregarCadastroClientes(dictCodigosExatos, dictIndiceTokens, nomesBase, codigosBase, nomesNormBase) Then
@@ -124,16 +130,17 @@ Public Sub GerarResumoPedidos_ComCodigoCliente()
                 End If
             Next j
 
-            If UCase(mercadoriaAtual) = "CAROÇO" Or UCase(mercadoriaAtual) = "CAROCO" Then
-                unidade = "KG"
-            Else
-                unidade = "SACOS"
-            End If
+            unidade = UnidadeDaMercadoria(mercadoriaAtual)
 
             If Not dictPedidos.exists(numPedido) Then
                 dictPedidos.Add numPedido, ""
                 linhasPrimeiraOcorrencia.Add numPedido, i
                 clientesPorPedido.Add numPedido, NormalizarNomeCliente(cliente)
+            End If
+
+            ' Qualquer linha do pedido com BOLETO marca o pedido inteiro (nao gera resumo).
+            If EhBoleto(formaPagamento) Then
+                If Not pedidosBoleto.exists(numPedido) Then pedidosBoleto.Add numPedido, True
             End If
 
             If clientesPorPedido.exists(numPedido) Then
@@ -210,12 +217,20 @@ Public Sub GerarResumoPedidos_ComCodigoCliente()
             End If
         Next j
 
-        resumo = cliente & " - " & numPedido & " - " & dataAtual & " - " & dictPedidos(numPedido) & " - " & formaPagamento
-        ws.Cells(i, "J").Value = resumo
+        If pedidosBoleto.exists(numPedido) Then
+            ' BOLETO nao entra no Contas a Receber: sem resumo na coluna J, para
+            ' nao ser lancado nem pelo robo nem manualmente.
+            AdicionarAlerta ws.Cells(i, "K"), "Pedido " & numPedido & " pago com BOLETO - NAO LANCAR (resumo nao gerado)"
+            totalBoleto = totalBoleto + 1
+        Else
+            resumo = cliente & " - " & numPedido & " - " & dataAtual & " - " & dictPedidos(numPedido) & " - " & formaPagamento
+            ws.Cells(i, "J").Value = resumo
+        End If
     Next numPedido
 
     totalAlertas = ContarAlertas(ws, lastRow)
     alerta = "Codigos dos clientes e resumo dos pedidos gerados com sucesso!"
+    If totalBoleto > 0 Then alerta = alerta & vbCrLf & vbCrLf & "Pedidos com BOLETO (sem resumo, nao lancar): " & totalBoleto
     If totalMercadoriasSemCodigo > 0 Then alerta = alerta & vbCrLf & vbCrLf & "Mercadorias sem codigo encontrado: " & totalMercadoriasSemCodigo & " (veja a coluna K nas linhas de titulo 'SAIDA DE ...')"
     If totalAlertas > 0 Then alerta = alerta & vbCrLf & vbCrLf & "Alertas encontrados na coluna K: " & totalAlertas
     MsgBox alerta, vbInformation
@@ -284,6 +299,29 @@ Private Function EhVendaAntecipada(ByVal formaPagamento As String) As Boolean
     Dim formaNorm As String
     formaNorm = NormalizarNomeCliente(formaPagamento)
     EhVendaAntecipada = (InStr(1, formaNorm, "VENDA ANTECIPADA", vbTextCompare) > 0)
+End Function
+
+Private Function EhBoleto(ByVal formaPagamento As String) As Boolean
+    EhBoleto = (InStr(1, NormalizarNomeCliente(formaPagamento), "BOLET", vbTextCompare) > 0)
+End Function
+
+' Mercadorias vendidas por KG (o resto e vendido em SACOS). Pelo historico de 2026,
+' so CAROCO (~R$ 1,80/kg) e OLEO (~R$ 8,00/kg); tambem vale qualquer titulo com a
+' palavra "KG" solta (ex.: "KG OLEO", "CAROCO KG") - "MILHO MOIDO 40KG" continua SACOS.
+' Para incluir outro produto, acrescente a palavra em Case abaixo.
+Private Function UnidadeDaMercadoria(ByVal mercadoria As String) As String
+    Dim palavras As Variant
+    Dim i As Long
+
+    UnidadeDaMercadoria = "SACOS"
+    palavras = Split(NormalizarNomeMercadoria(mercadoria), " ")
+    For i = LBound(palavras) To UBound(palavras)
+        Select Case CStr(palavras(i))
+            Case "CAROCO", "OLEO", "KG"
+                UnidadeDaMercadoria = "KG"
+                Exit Function
+        End Select
+    Next i
 End Function
 
 Private Sub AdicionarAlerta(ByVal celula As Range, ByVal texto As String)
