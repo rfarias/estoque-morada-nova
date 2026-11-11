@@ -326,19 +326,28 @@ def mensagem_do_fortes():
     return titulo
 
 
-def confirmar_mensagem(tentativas=6):
-    """Se aparecer a mensagem do Fortes (ex.: depois do cliente), aperta Ok (Enter)."""
-    for _ in range(tentativas):
+def confirmar_mensagem(tentativas=6, espera_max=0.0):
+    """Se aparecer a mensagem do Fortes (ex.: limite de credito depois do cliente), aperta Ok
+    (Enter). espera_max > 0: com o acesso remoto lento a mensagem pode demorar, entao espera
+    ate esse tempo por ela antes de seguir (sai logo depois de responder)."""
+    fim = time.time() + espera_max
+    respondeu = False
+    n = 0
+    while True:
         esperar(0.5)
+        n += 1
         tit = mensagem_do_fortes()
         if tit is None:
-            if fortes_ok():
+            if fortes_ok() and (respondeu or time.time() >= fim):
+                return
+            if n >= tentativas and time.time() >= fim:
                 return
             continue
         if "Informação" not in tit:
             raise TelaErrada(f"Apareceu a janela '{tit}' e nao sei o que responder - parei.")
         print(f"[mensagem '{tit}' -> Ok] ", end="", flush=True)
         pyautogui.press("enter")
+        respondeu = True
         esperar(PAUSA)
 
 
@@ -569,12 +578,23 @@ class TelaErrada(Exception):
     pass
 
 
-def texto_na_mensagem(ref, regiao):
-    import pyscreeze
-    try:
-        return pyscreeze.locateOnScreen(ref, region=regiao) is not None
-    except pyscreeze.ImageNotFoundException:
+def texto_na_mensagem(ref, regiao, tolerancia=40):
+    """Procura a imagem ref na regiao aceitando pequena diferenca de cor (o acesso
+    remoto muda alguns tons, e a busca exata do pyscreeze falha)."""
+    import numpy as np
+    from PIL import Image
+    tela = np.asarray(pyautogui.screenshot(region=regiao).convert("RGB"), dtype=np.int16)
+    alvo = np.asarray(Image.open(ref).convert("RGB"), dtype=np.int16)
+    h, w = alvo.shape[:2]
+    H, W = tela.shape[:2]
+    if h > H or w > W:
         return False
+    # filtra posicoes pelo pixel do canto e depois confere a imagem inteira
+    canto = np.abs(tela[:H - h + 1, :W - w + 1] - alvo[0, 0]).max(axis=2) <= tolerancia
+    for y, x in zip(*np.nonzero(canto)):
+        if np.abs(tela[y:y + h, x:x + w] - alvo).max() <= tolerancia:
+            return True
+    return False
 
 
 def campo_st_da_mensagem():
@@ -610,7 +630,7 @@ def tratar_st_em_branco():
             checar_parada()
             acao("clique em item_unidade (confere STA/STB)")
             pyautogui.click(*P["item_unidade"])
-        tit = aguardar_mensagem(2.0)
+        tit = aguardar_mensagem(4.0)  # acesso remoto lento: o aviso pode demorar 2-3 s
         if tit is None:
             return
         campo = campo_st_da_mensagem() if "Atenção" in tit else None
@@ -643,7 +663,7 @@ def abrir_e_preencher_cabecalho(ped):
     # Cabecalho
     preencher("estabelecimento", ESTABELECIMENTO, espera=PAUSA_LOOKUP)
     preencher("cliente", ped["cliente"], espera=PAUSA_LOOKUP, mensagem=True)
-    confirmar_mensagem()  # mensagem que aparece depois do cliente -> Ok
+    confirmar_mensagem(espera_max=6.0)  # mensagem (limite de credito) depois do cliente -> Ok
     preencher("centro", CENTRO_RESULTADOS, espera=PAUSA_LOOKUP)
     preencher("receita", RECEITA, espera=PAUSA_LOOKUP)
     preencher("emissao", data_digitos(ped["emissao"]))
