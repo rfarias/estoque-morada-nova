@@ -72,6 +72,7 @@ PAINEL_BASE = {
     "item_codigo": (55, 553),
     "item_sta": (32, 705),
     "item_stb": (244, 705),
+    "item_cfop": (40, 661),
     "item_unidade": (38, 793),
     "item_qtd": (302, 793),
     "item_valor": (393, 793),
@@ -90,6 +91,8 @@ REF_ABAS_TOPO = 493
 REF_MSG_STA = os.path.join(PASTA, "ref_msg_sta.png")      # texto: Campo "STA" em branco.
 REF_MSG_CAMPO_ST = os.path.join(PASTA, "ref_msg_campo_st.png")  # texto: Campo "ST
 VALORES_ST = {"item_sta": "0", "item_stb": "40"}  # o que digitar quando o Fortes reclama do campo em branco
+REF_MSG_NAO_CADASTRADO = os.path.join(PASTA, "ref_msg_nao_cadastrado.png")  # texto: Não cadastrado.
+CFOP_NAO_CADASTRADO = "6949"  # quando o Fortes diz 'Não cadastrado.' no CFOP -> Ok e digita este CFOP
 
 
 def ajustar_painel():
@@ -607,6 +610,8 @@ def campo_st_da_mensagem():
         return "item_sta"
     if texto_na_mensagem(REF_MSG_CAMPO_ST, regiao):
         return "item_stb"
+    if texto_na_mensagem(REF_MSG_NAO_CADASTRADO, regiao):
+        return "item_cfop"
     return None
 
 
@@ -622,9 +627,12 @@ def aguardar_mensagem(segundos):
 
 def tratar_st_em_branco():
     """Sai do bloco de situacao tributaria clicando em Unidade. Se o Fortes avisar
-    'Campo "STA" em branco' -> Ok e digita 0; se avisar do campo seguinte -> Ok e digita 40."""
-    feitos = set()
-    for _ in range(len(VALORES_ST) + 1):
+    'Campo "STA" em branco' -> Ok e digita 0; se avisar do campo seguinte -> Ok e digita 40.
+    Se avisar 'Não cadastrado.' (CFOP) -> Ok e digita o CFOP 6949."""
+    # A leitura do texto da mensagem as vezes confunde STA com STB (acesso remoto muda
+    # os tons). Por isso, a qualquer aviso de campo ST em branco, preenche os DOIS campos.
+    cfop_trocado = False
+    for _ in range(4):
         if mensagem_do_fortes() is None:
             conferir_janela("(antes de sair do bloco de situacao tributaria)")
             checar_parada()
@@ -634,16 +642,29 @@ def tratar_st_em_branco():
         if tit is None:
             return
         campo = campo_st_da_mensagem() if "Atenção" in tit else None
-        if campo is None or campo in feitos:
+        if campo is None:
             raise TelaErrada(f"Apareceu a janela '{tit}' e nao sei o que responder - parei.")
-        feitos.add(campo)
-        valor = VALORES_ST[campo]
-        print(f"[{campo[5:].upper()} em branco -> {valor}] ", end="", flush=True)
+        if campo == "item_cfop":
+            if cfop_trocado:
+                raise TelaErrada(f"O Fortes continuou dizendo 'Nao cadastrado' depois do CFOP {CFOP_NAO_CADASTRADO}.")
+            print(f"[CFOP nao cadastrado -> {CFOP_NAO_CADASTRADO}] ", end="", flush=True)
+            pyautogui.press("enter")
+            esperar(PAUSA)
+            if mensagem_do_fortes() is not None:
+                raise TelaErrada("Apertei Ok mas a mensagem 'Nao cadastrado' continuou aberta.")
+            preencher("item_cfop", CFOP_NAO_CADASTRADO, espera=PAUSA_LOOKUP, mensagem=True, verificar=False)
+            cfop_trocado = True
+            continue  # volta a clicar em Unidade e confere de novo
+        print(f"[ST em branco -> STA {VALORES_ST['item_sta']} / STB {VALORES_ST['item_stb']}] ",
+              end="", flush=True)
         pyautogui.press("enter")
         esperar(PAUSA)
         if mensagem_do_fortes() is not None:
             raise TelaErrada("Apertei Ok mas a mensagem do campo em branco continuou aberta.")
-        preencher(campo, valor, espera=PAUSA_LOOKUP, mensagem=True, verificar=False)
+        for c in ("item_sta", "item_stb"):
+            preencher(c, VALORES_ST[c], espera=PAUSA_LOOKUP, mensagem=True, verificar=False)
+            if mensagem_do_fortes() is not None:
+                break  # o Fortes reclamou de novo: o laco responde
     raise TelaErrada("O Fortes continuou reclamando de STA/STB depois de preencher.")
 
 
